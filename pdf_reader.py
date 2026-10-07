@@ -1,136 +1,118 @@
-import PyPDF2
-from langchain.text_splitter import CharacterTextSplitter
-import streamlit as st
-from dotenv import load_dotenv
-from langchain.embeddings import OpenAIEmbeddings #HuggingFaceInstructEmbeddings
-from langchain.vectorstores import Chroma
-# from langchain.memory import ConversationBufferMemory
-# from langchain.chains import ConversationalRetrievalChain
-from langchain.chat_models import ChatOpenAI
-from langchain.chains import RetrievalQA
-from htmlTemplates import css, bot_template, user_template
-from concurrent.futures import ProcessPoolExecutor
+"""Chat with your PDFs: a small RAG app built with Streamlit, LangChain, OpenAI and Chroma.
+
+Pipeline: upload PDFs -> extract text -> split into overlapping chunks ->
+embed with OpenAI -> store in Chroma -> answer questions with a RetrievalQA chain.
+"""
+
 import os
 
-#write chatgpt APi key: 
-os.environ['OPENAI_API_KEY'] = '##################'      
+import streamlit as st
+from dotenv import load_dotenv
+from PyPDF2 import PdfReader
+from langchain.chains import RetrievalQA
+from langchain_chroma import Chroma
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_text_splitters import CharacterTextSplitter
+
+CHUNK_SIZE = 1000
+CHUNK_OVERLAP = 200
+TOP_K = 4
 
 
 def get_pdf_text(pdf_docs):
+    """Return the text of every page of every uploaded PDF."""
     text = ""
     for pdf in pdf_docs:
-        pdf_reader = PyPDF2.PdfReader(pdf)
-        for page in pdf_reader.pages:
-            text += page.extract_text()
-
+        reader = PdfReader(pdf)
+        for page in reader.pages:
+            # extract_text() can return None for pages without a text layer
+            text += (page.extract_text() or "") + "\n"
     return text
 
-def get_pdf_text_parallel(pdf_docs):
-    with ProcessPoolExecutor() as executor:
-        text_chunks = list(executor.map(get_pdf_text, pdf_docs))
-        return "".join(text_chunks)
 
 def get_text_chunks(text):
-    text_splitter = CharacterTextSplitter(
+    """Split text into overlapping chunks so each answer keeps its context."""
+    splitter = CharacterTextSplitter(
         separator="\n",
-        chunk_size=1000,
-        chunk_overlap = 200,
-        length_function=len
+        chunk_size=CHUNK_SIZE,
+        chunk_overlap=CHUNK_OVERLAP,
+        length_function=len,
     )
-    chunks = text_splitter.split_text(text)
-    return chunks
+    return splitter.split_text(text)
 
 
 def get_vectorstore(text_chunks):
-    embeddings = OpenAIEmbeddings()
-    vectorstore = Chroma.from_texts(text_chunks, embeddings)
-    return vectorstore
+    """Embed the chunks with OpenAI and store them in an in-memory Chroma index."""
+    return Chroma.from_texts(text_chunks, OpenAIEmbeddings())
 
 
-def get_conversation_chain(vectorstore):
-    llm = ChatOpenAI(model_name='gpt-3.5-turbo')
-    # llm = HuggingFaceHub(repo_id="google/flan-t5-xxl", model_kwargs={"temperature":0.5, "max_length":512})
-    chain = RetrievalQA.from_chain_type(
-        llm=llm,
-        chain_type='stuff',
-        retriever=vectorstore.as_retriever(search_type = "similarity", search_kwargs={"k": k})
-    )
-    return chain
-
-    # memory = ConversationBufferMemory(memory_key= 'chat_history', return_messages=True)
-    # conversation_chain = ConversationalRetrievalChain.from_llm(
-    #     llm=llm,
-    #     retriever=vectorstore.as_retriever(),
-    #     memory= memory,
-    # )
-    # return conversation_chain
+def get_qa_chain(vectorstore, k=TOP_K):
+    """Build a RetrievalQA chain that answers from the k most similar chunks."""
+    llm = ChatOpenAI(model=os.getenv("OPENAI_MODEL", "gpt-3.5-turbo"), temperature=0)
+    retriever = vectorstore.as_retriever(search_type="similarity", search_kwargs={"k": k})
+    return RetrievalQA.from_chain_type(llm=llm, chain_type="stuff", retriever=retriever)
 
 
-def handle_userinput(user_question):
-    response = st.session_state.conversation({'question': user_question})
-    st.session_state.chat_history = response['chat_history']
-    
-    for i, message in enumerate(st.session_state.chat_history):
-        if i % 2 == 0:
-            st.write(user_template.replace(
-                "{{MSG}}", message.content), unsafe_allow_html=True)
-        else:
-            st.write(bot_template.replace(
-                "{{MSG}}", message.content), unsafe_allow_html=True)
+def answer_question(chain, question):
+    """Run one question through the chain and return the answer text."""
+    return chain.invoke({"query": question})["result"]
 
 
+def process_documents(pdf_docs):
+    """Turn uploaded PDFs into a ready-to-use QA chain (sidebar 'Process' button)."""
+    if not os.getenv("OPENAI_API_KEY"):
+        st.error("OPENAI_API_KEY is not set. Copy .env.example to .env and add your key.")
+        return
+    if not pdf_docs:
+        st.warning("Upload at least one PDF first.")
+        return
+    with st.spinner("Processing"):
+        chunks = get_text_chunks(get_pdf_text(pdf_docs))
+        if not chunks:
+            st.error("No text found. Scanned PDFs need OCR before they can be read.")
+            return
+        st.session_state.qa_chain = get_qa_chain(get_vectorstore(chunks))
+        st.session_state.chat_history = []
+    st.success(f"Ready: {len(chunks)} chunks from {len(pdf_docs)} file(s).")
 
 
 def main():
     load_dotenv()
     st.set_page_config(page_title="Chat with multiple PDFs", page_icon=":books:")
-
-    st.write(css, unsafe_allow_html=True)
-  
-  
-    if "conversation" not in st.session_state:
-        st.session_state.conversation = None
-   
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history =[]
-   
     st.header("Chat with multiple PDFs :books:")
-    user_question = st.text_input("Ask a question about pdf documents: ")
-    if user_question:
-        k_value = st.session_state.k_value if "k_value" in st.session_state else 3
-        conversation_chain = st.session_state.conversation or get_conversation_chain(user_question, st.session_state.vectorstore, k = k_value)
-        handle_userinput(user_question, conversation_chain, st.session_state.chat_history)
 
-
-
-    st.write(user_template.replace("{{MSG}}", "Hello rebot"), unsafe_allow_html=True)
-    st.write(bot_template.replace("{{MSG}}", "Hello human"), unsafe_allow_html=True)
+    if "qa_chain" not in st.session_state:
+        st.session_state.qa_chain = None
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = []
 
     with st.sidebar:
-        st.subheader("Your Documents")
+        st.subheader("Your documents")
         pdf_docs = st.file_uploader(
-            "Upload your pdf and press and click process", accept_multiple_files=True)
-        if pdf_docs:
-            k_value = len(pdf_docs)
-            st.session_state.k_value = k_value
+            "Upload your PDFs, then click Process", type="pdf", accept_multiple_files=True
+        )
         if st.button("Process"):
-            with st.spinner("Processing"):
-                # get pdf text
-                raw_text = get_pdf_text(pdf_docs)
-                # st.write(raw_text)
+            process_documents(pdf_docs)
 
-                # get the text chunks
-                text_chunks = get_text_chunks(raw_text)
-                # st.write(text_chunks)
+    for role, message in st.session_state.chat_history:
+        with st.chat_message(role):
+            st.write(message)
 
-                # create vector store
-                vectorstore = get_vectorstore(text_chunks)
+    question = st.chat_input("Ask a question about your documents")
+    if not question:
+        return
+    if st.session_state.qa_chain is None:
+        st.warning("Upload your PDFs and click Process first.")
+        return
 
-                # create conversation chain
-                st.session_state.vectorstore = vectorstore
-                st.session_state.conversation = get_conversation_chain(user_question,vectorstore, k = k_value)  
+    with st.chat_message("user"):
+        st.write(question)
+    with st.chat_message("assistant"):
+        with st.spinner("Thinking"):
+            answer = answer_question(st.session_state.qa_chain, question)
+        st.write(answer)
+    st.session_state.chat_history += [("user", question), ("assistant", answer)]
 
 
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
